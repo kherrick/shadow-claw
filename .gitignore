@@ -1,5 +1,5 @@
-dist
-dev-dist
-node_modules
+.cache
 .env
-.playwright-mcp
+node_modules
+service-worker.js
+workbox-*.js

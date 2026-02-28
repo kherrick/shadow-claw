@@ -1,0 +1,764 @@
+import {
+  ASSISTANT_NAME,
+  CONFIG_KEYS,
+  CONTEXT_WINDOW_SIZE,
+  DEFAULT_GROUP_ID,
+  DEFAULT_MAX_TOKENS,
+  DEFAULT_PROVIDER,
+  PROVIDERS,
+  buildTriggerPattern,
+  getProvider,
+  getDefaultProvider,
+} from "./config.mjs";
+
+import { BrowserChatChannel } from "./channels/browser-chat.mjs";
+import { encryptValue, decryptValue } from "./crypto.mjs";
+
+import {
+  openDatabase,
+  saveMessage,
+  buildConversationMessages,
+  getConfig,
+  setConfig,
+  saveTask,
+  deleteTask,
+  getAllTasks,
+  clearGroupMessages,
+} from "./db.mjs";
+
+import { readGroupFile } from "./storage.mjs";
+import { Router } from "./router.mjs";
+import { TaskScheduler } from "./task-scheduler.mjs";
+import { ulid } from "./ulid.mjs";
+
+import "./types.mjs";
+
+/**
+ * Simple event emitter for orchestrator events
+ */
+class EventBus {
+  constructor() {
+    /** @type {Map<string, Set<Function>>} */
+    this.listeners = new Map();
+  }
+
+  /**
+   * @param {string} event
+   * @param {Function} callback
+   */
+  on(event, callback) {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, new Set());
+    }
+    this.listeners.get(event)?.add(callback);
+  }
+
+  /**
+   * @param {string} event
+   * @param {Function} callback
+   */
+  off(event, callback) {
+    this.listeners.get(event)?.delete(callback);
+  }
+
+  /**
+   * @param {string} event
+   * @param {any} data
+   */
+  emit(event, data) {
+    this.listeners.get(event)?.forEach((cb) => cb(data));
+  }
+}
+
+/**
+ * Main orchestrator class
+ */
+export class Orchestrator {
+  constructor() {
+    this.events = new EventBus();
+    this.browserChat = new BrowserChatChannel();
+
+    /** @type {Router|null} */
+    this.router = null;
+    /** @type {TaskScheduler|null} */
+    this.scheduler = null;
+    /** @type {Worker|null} */
+    this.agentWorker = null;
+
+    /** @type {'idle'|'thinking'|'responding'} */
+    this.state = "idle";
+    /** @type {RegExp} */
+    this.triggerPattern = buildTriggerPattern(ASSISTANT_NAME);
+    /** @type {string} */
+    this.assistantName = ASSISTANT_NAME;
+    /** @type {string} */
+    this.provider = DEFAULT_PROVIDER;
+    /** @type {import('./config.mjs').ProviderConfig} */
+    this.providerConfig = getDefaultProvider();
+    /** @type {string} */
+    this.apiKey = "";
+    /** @type {string} */
+    this.model = getDefaultProvider().defaultModel;
+    /** @type {number} */
+    this.maxTokens = DEFAULT_MAX_TOKENS;
+    /** @type {any[]} */
+    this.messageQueue = [];
+    /** @type {boolean} */
+    this.processing = false;
+    /** @type {Set<string>} */
+    this.pendingScheduledTasks = new Set();
+  }
+
+  /**
+   * Initialize the orchestrator
+   *
+   * @returns {Promise<void>}
+   */
+  async init() {
+    // Open database
+    await openDatabase();
+
+    // Load config
+    this.assistantName =
+      (await getConfig(CONFIG_KEYS.ASSISTANT_NAME)) || ASSISTANT_NAME;
+
+    this.triggerPattern = buildTriggerPattern(this.assistantName);
+
+    // Load provider
+    const storedProvider = await getConfig(CONFIG_KEYS.PROVIDER);
+    if (storedProvider && getProvider(storedProvider)) {
+      this.provider = storedProvider;
+      this.providerConfig = getProvider(storedProvider) || getDefaultProvider();
+    }
+
+    // Load API key
+    let storedKey = await getConfig(CONFIG_KEYS.API_KEY);
+    if (storedKey) {
+      try {
+        this.apiKey = await decryptValue(storedKey);
+      } catch (_) {
+        this.apiKey = "";
+
+        await setConfig(CONFIG_KEYS.API_KEY, "");
+      }
+    }
+
+    // Load model and max tokens
+    const storedModel = await getConfig(CONFIG_KEYS.MODEL);
+    if (storedModel) {
+      this.model = storedModel;
+    } else {
+      this.model = this.providerConfig.defaultModel;
+    }
+
+    this.maxTokens = parseInt(
+      (await getConfig(CONFIG_KEYS.MAX_TOKENS)) || String(DEFAULT_MAX_TOKENS),
+      10,
+    );
+
+    // Set up router
+    this.router = new Router(this.browserChat);
+
+    // Set up channels
+    this.browserChat.onMessage((msg) => this.enqueue(msg));
+
+    this.agentWorker = new Worker(new URL("../worker.mjs", import.meta.url), {
+      type: "module",
+    });
+
+    this.agentWorker.onmessage = (event) =>
+      this.handleWorkerMessage(event.data);
+
+    this.agentWorker.onerror = (err) => {
+      console.error("Agent worker error:", err);
+    };
+
+    // Pass storage handle if it exists
+    const storageHandle = await getConfig(CONFIG_KEYS.STORAGE_HANDLE);
+    if (storageHandle) {
+      this.agentWorker.postMessage({
+        type: "set-storage",
+        payload: { storageHandle },
+      });
+    }
+
+    // Set up task scheduler
+    this.scheduler = new TaskScheduler((groupId, prompt) =>
+      this.invokeAgent(groupId, prompt),
+    );
+    this.scheduler.start();
+
+    // Wire up browser chat display callback
+    this.browserChat.onDisplay(() => {
+      // Display handled via events.emit('message', ...)
+    });
+
+    this.events.emit("ready", undefined);
+  }
+
+  /**
+   * Get current state
+   * @returns {'idle'|'thinking'|'responding'}
+   */
+  getState() {
+    return this.state;
+  }
+
+  /**
+   * Check if API key is configured
+   * @returns {boolean}
+   */
+  isConfigured() {
+    return this.apiKey.length > 0;
+  }
+
+  /**
+   * Update API key
+   * @param {string} key
+   * @returns {Promise<void>}
+   */
+  async setApiKey(key) {
+    this.apiKey = key;
+    const encrypted = await encryptValue(key);
+    await setConfig(CONFIG_KEYS.API_KEY, encrypted);
+  }
+
+  /**
+   * Get current provider
+   * @returns {string}
+   */
+  getProvider() {
+    return this.provider;
+  }
+
+  /**
+   * Get available providers
+   * @returns {Object[]}
+   */
+  /**
+   * @returns {import('./types.mjs').LLMProvider[]}
+   */
+  getAvailableProviders() {
+    return Object.entries(PROVIDERS).map(([id, config]) => ({
+      id,
+      name: config.name,
+      models: [config.defaultModel], // Can be expanded with more models per provider
+    }));
+  }
+
+  /**
+   * Switch to a different provider
+   * @param {string} providerId
+   * @returns {Promise<void>}
+   */
+  async setProvider(providerId) {
+    const newProvider = getProvider(providerId);
+    if (!newProvider) {
+      throw new Error(`Unknown provider: ${providerId}`);
+    }
+    this.provider = providerId;
+    this.providerConfig = newProvider;
+    this.model = newProvider.defaultModel;
+    await setConfig(CONFIG_KEYS.PROVIDER, providerId);
+    await setConfig(CONFIG_KEYS.MODEL, this.model);
+  }
+
+  /**
+   * Get current model
+   * @returns {string}
+   */
+  getModel() {
+    return this.model;
+  }
+
+  /**
+   * Update model
+   * @param {string} model
+   * @returns {Promise<void>}
+   */
+  async setModel(model) {
+    this.model = model;
+    await setConfig(CONFIG_KEYS.MODEL, model);
+  }
+
+  /**
+   * Get assistant name
+   * @returns {string}
+   */
+  getAssistantName() {
+    return this.assistantName;
+  }
+
+  /**
+   * Update assistant name
+   * @param {string} name
+   *
+   * @returns {Promise<void>}
+   */
+  async setAssistantName(name) {
+    this.assistantName = name;
+    this.triggerPattern = buildTriggerPattern(name);
+
+    await setConfig(CONFIG_KEYS.ASSISTANT_NAME, name);
+  }
+
+  /**
+   * Submit message from browser chat UI
+   * @param {string} text
+   * @param {string} [groupId]
+   */
+  submitMessage(text, groupId) {
+    this.browserChat.submit(text, groupId);
+  }
+
+  /**
+   * Start a new session (clears message history)
+   * @param {string} [groupId]
+   *
+   * @returns {Promise<void>}
+   */
+  async newSession(groupId = DEFAULT_GROUP_ID) {
+    await clearGroupMessages(groupId);
+
+    this.events.emit("session-reset", { groupId });
+  }
+
+  /**
+   * Compact (summarize) context
+   * @param {string} [groupId]
+   *
+   * @returns {Promise<void>}
+   */
+  async compactContext(groupId = DEFAULT_GROUP_ID) {
+    if (!this.apiKey) {
+      this.events.emit("error", {
+        groupId,
+        error: "API key not configured. Cannot compact context.",
+      });
+      return;
+    }
+
+    if (this.state !== "idle") {
+      this.events.emit("error", {
+        groupId,
+        error:
+          "Cannot compact while processing. Wait for the current response to finish.",
+      });
+      return;
+    }
+
+    this.setState("thinking");
+    this.events.emit("typing", { groupId, typing: true });
+
+    let memory = "";
+    try {
+      memory = await readGroupFile(groupId, "MEMORY.md");
+    } catch {
+      // No memory file yet
+    }
+
+    const messages = await buildConversationMessages(
+      groupId,
+      CONTEXT_WINDOW_SIZE,
+    );
+    const systemPrompt = buildSystemPrompt(this.assistantName, memory);
+
+    this.agentWorker?.postMessage({
+      type: "compact",
+      payload: {
+        groupId,
+        messages,
+        systemPrompt,
+        apiKey: this.apiKey,
+        model: this.model,
+        maxTokens: this.maxTokens,
+        provider: this.provider,
+        storageHandle: await getConfig(CONFIG_KEYS.STORAGE_HANDLE),
+      },
+    });
+  }
+
+  /**
+   * Shut down everything
+   */
+  shutdown() {
+    this.scheduler?.stop();
+    this.agentWorker?.terminate();
+  }
+
+  /**
+   * @param {'idle'|'thinking'|'responding'} state
+   */
+  setState(state) {
+    this.state = state;
+    this.events.emit("state-change", state);
+  }
+
+  /**
+   * @param {import('./types.mjs').InboundMessage} msg
+   *
+   * @returns {Promise<void>}
+   */
+  async enqueue(msg) {
+    // Check trigger
+    const isBrowserMain = msg.groupId === DEFAULT_GROUP_ID;
+    const hasTrigger = this.triggerPattern.test(msg.content.trim());
+
+    const stored = {
+      ...msg,
+      isFromMe: false,
+      isTrigger: isBrowserMain || hasTrigger,
+    };
+
+    if (isBrowserMain || hasTrigger) {
+      this.messageQueue.push(msg);
+    }
+
+    await saveMessage(stored);
+    this.events.emit("message", stored);
+
+    this.processQueue();
+  }
+
+  /**
+   * @returns {Promise<void>}
+   */
+  async processQueue() {
+    if (this.processing) return;
+    if (this.messageQueue.length === 0) return;
+
+    if (!this.apiKey) {
+      const msg = this.messageQueue.shift();
+      this.events.emit("error", {
+        groupId: msg.groupId,
+        error: "API key not configured. Go to Settings to add your API key.",
+      });
+
+      return;
+    }
+
+    this.processing = true;
+    const msg = this.messageQueue.shift();
+
+    try {
+      await this.invokeAgent(msg.groupId, msg.content);
+    } catch (err) {
+      console.error("Failed to invoke agent:", err);
+    } finally {
+      this.processing = false;
+      if (this.messageQueue.length > 0) {
+        this.processQueue();
+      }
+    }
+  }
+
+  /**
+   * @param {string} groupId
+   * @param {string} triggerContent
+   *
+   * @returns {Promise<void>}
+   */
+  async invokeAgent(groupId, triggerContent) {
+    this.setState("thinking");
+    this.router?.setTyping(groupId, true);
+    this.events.emit("typing", { groupId, typing: true });
+
+    // Save scheduled task as client message
+    if (triggerContent.startsWith("[SCHEDULED TASK]")) {
+      this.pendingScheduledTasks.add(groupId);
+
+      const stored = {
+        id: ulid(),
+        groupId,
+        sender: "Scheduler",
+        content: triggerContent,
+        timestamp: Date.now(),
+        channel: /** @type {import('./types.mjs').ChannelType} */ (
+          groupId.startsWith("bg:") ? "browser" : ""
+        ),
+        isFromMe: false,
+        isTrigger: true,
+      };
+
+      await saveMessage(stored);
+
+      this.events.emit("message", stored);
+    }
+
+    // Load group memory
+    let memory = "";
+    try {
+      memory = await readGroupFile(groupId, "MEMORY.md");
+    } catch {}
+
+    // Build conversation context
+    const messages = await buildConversationMessages(
+      groupId,
+      CONTEXT_WINDOW_SIZE,
+    );
+
+    const systemPrompt = buildSystemPrompt(this.assistantName, memory);
+
+    // Send to agent worker
+    this.agentWorker?.postMessage({
+      type: "invoke",
+      payload: {
+        groupId,
+        messages,
+        systemPrompt,
+        apiKey: this.apiKey,
+        model: this.model,
+        maxTokens: this.maxTokens,
+        provider: this.provider,
+        storageHandle: await getConfig(CONFIG_KEYS.STORAGE_HANDLE),
+      },
+    });
+  }
+
+  /**
+   * @param {any} msg
+   *
+   * @returns {Promise<void>}
+   */
+  async handleWorkerMessage(msg) {
+    switch (msg.type) {
+      case "response": {
+        const { groupId, text } = msg.payload;
+        await this.deliverResponse(groupId, text);
+        break;
+      }
+
+      case "task-created": {
+        const { task } = msg.payload;
+        try {
+          await saveTask(task);
+          this.events.emit("task-change", { type: "created", task });
+        } catch (err) {
+          console.error("Failed to save task from agent:", err);
+        }
+
+        break;
+      }
+
+      case "error": {
+        const { groupId, error } = msg.payload;
+        await this.deliverResponse(groupId, `⚠️ Error: ${error}`);
+
+        break;
+      }
+
+      case "typing": {
+        const { groupId } = msg.payload;
+        this.router?.setTyping(groupId, true);
+        this.events.emit("typing", { groupId, typing: true });
+
+        break;
+      }
+
+      case "tool-activity": {
+        this.events.emit("tool-activity", msg.payload);
+        // If a file was written, or bash finished (might have changed files), emit file-change
+        if (
+          (msg.payload.tool === "write_file" &&
+            msg.payload.status === "done") ||
+          (msg.payload.tool === "bash" && msg.payload.status === "done")
+        ) {
+          this.events.emit("file-change", {
+            groupId: msg.payload.groupId,
+          });
+        }
+
+        break;
+      }
+
+      case "thinking-log": {
+        this.events.emit("thinking-log", msg.payload);
+
+        break;
+      }
+
+      case "compact-done": {
+        await this.handleCompactDone(msg.payload.groupId, msg.payload.summary);
+
+        break;
+      }
+
+      case "token-usage": {
+        this.events.emit("token-usage", msg.payload);
+
+        break;
+      }
+
+      case "task-list-request": {
+        const { groupId } = msg.payload;
+        const tasks = await getAllTasks();
+        const groupTasks = tasks.filter((t) => t.groupId === groupId);
+        this.agentWorker?.postMessage({
+          type: "task-list-response",
+          payload: { groupId, tasks: groupTasks },
+        });
+
+        break;
+      }
+
+      case "update-task": {
+        const { task } = msg.payload;
+        try {
+          await saveTask(task);
+          this.events.emit("task-change", { type: "updated", task });
+        } catch (err) {
+          console.error("Failed to update task from agent:", err);
+        }
+
+        break;
+      }
+
+      case "delete-task": {
+        const { id } = msg.payload;
+        try {
+          await deleteTask(id);
+          this.events.emit("task-change", { type: "deleted", id });
+        } catch (err) {
+          console.error("Failed to delete task from agent:", err);
+        }
+
+        break;
+      }
+    }
+  }
+
+  /**
+   * @param {string} groupId
+   * @param {string} summary
+   *
+   * @returns {Promise<void>}
+   */
+  async handleCompactDone(groupId, summary) {
+    await clearGroupMessages(groupId);
+
+    const stored = {
+      id: ulid(),
+      groupId,
+      sender: this.assistantName,
+      content: `📝 **Context Compacted**\n\n${summary}`,
+      timestamp: Date.now(),
+      channel: /** @type {import('./types.mjs').ChannelType} */ (
+        groupId.startsWith("bg:") ? "browser" : ""
+      ),
+      isFromMe: true,
+      isTrigger: false,
+    };
+
+    await saveMessage(stored);
+
+    this.events.emit("context-compacted", { groupId, summary });
+    this.events.emit("typing", { groupId, typing: false });
+    this.setState("idle");
+  }
+
+  /**
+   * @param {string} groupId
+   * @param {string} text
+   *
+   * @returns {Promise<void>}
+   */
+  async deliverResponse(groupId, text) {
+    const stored = {
+      id: ulid(),
+      groupId,
+      sender: this.assistantName,
+      content: text,
+      timestamp: Date.now(),
+      channel: /** @type {import('./types.mjs').ChannelType} */ (
+        groupId.startsWith("bg:") ? "browser" : ""
+      ),
+      isFromMe: true,
+      isTrigger: false,
+    };
+
+    await saveMessage(stored);
+    await this.router?.send(groupId, text);
+
+    if (this.pendingScheduledTasks.has(groupId)) {
+      this.pendingScheduledTasks.delete(groupId);
+      playNotificationChime();
+    }
+
+    this.events.emit("message", stored);
+    this.events.emit("typing", { groupId, typing: false });
+
+    this.setState("idle");
+    this.router?.setTyping(groupId, false);
+  }
+}
+
+/**
+ * Build system prompt
+ *
+ * @param {string} assistantName
+ * @param {string} memory
+ *
+ * @returns {string}
+ */
+function buildSystemPrompt(assistantName, memory) {
+  const parts = [
+    `You are ${assistantName}, a personal AI assistant running in the client's browser.`,
+    "",
+    "You have access to the following tools:",
+    "- **bash**: Execute commands in a sandboxed Linux VM (Alpine).",
+    "- **javascript**: Execute JavaScript code. Lighter than bash — no VM boot needed.",
+    "- **read_file** / **write_file** / **list_files**: Manage files in the group workspace.",
+    "- **fetch_url**: Make HTTP requests (subject to CORS).",
+    "- **update_memory**: Persist important context to MEMORY.md.",
+    "- **create_task**: Schedule recurring tasks with cron expressions.",
+    "- **list_tasks** / **update_task** / **delete_task** / **enable_task** / **disable_task**: Manage scheduled tasks.",
+    "",
+    "Guidelines:",
+    "- Be concise and direct.",
+    "- Use tools proactively when they help answer the question.",
+    "- Update memory when you learn important preferences or context.",
+    "- For scheduled tasks, confirm the schedule with the client.",
+    "- The cron expression for a task to be executed once, should be for that exact time.",
+    "- Manage tasks. If you create a task, make sure to disable (or delete) it when it's no longer needed.",
+    "- Strip <internal> tags from your responses.",
+  ];
+
+  if (memory) {
+    parts.push("", "## Persistent Memory", "", memory);
+  }
+
+  return parts.join("\n");
+}
+
+/**
+ * Play notification chime
+ */
+function playNotificationChime() {
+  try {
+    const ctx = new AudioContext();
+    const now = ctx.currentTime;
+
+    // Two-tone chime: C5 → E5
+    const frequencies = [523.25, 659.25];
+    for (let i = 0; i < frequencies.length; i++) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = "sine";
+      osc.frequency.value = frequencies[i];
+
+      gain.gain.setValueAtTime(0.3, now + i * 0.15);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.15 + 0.4);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.start(now + i * 0.15);
+      osc.stop(now + i * 0.15 + 0.4);
+    }
+
+    setTimeout(() => ctx.close(), 1000);
+  } catch {
+    // AudioContext may not be available
+  }
+}

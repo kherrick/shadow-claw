@@ -1,160 +1,180 @@
-# OpenBrowserClaw
+# 🦞 [ShadowClaw](https://xt-ml.github.io/shadow-claw/)
 
-> **Disclaimer:** OpenBrowserClaw is a personal, open-source project. It is **not** affiliated with any cryptocurrency, meme coin, token, or social media account. If you see coins, tokens, or social media profiles claiming association with this project, they are **not legitimate** and are not endorsed by the author(s). Stay safe and do your own research.
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/xt-ml/shadow-claw)
 
-Browser-native personal AI assistant. Zero infrastructure — the browser is the server.
 
-Built as a browser-only reimagination of NanoClaw. Same philosophy, small enough to understand, built for one user, but running entirely in a browser tab.
+Browser-native personal AI assistant. A complete reimagination of NanoClaw — same
+single-user, small-enough-to-understand philosophy, but running entirely in a browser
+tab with no build step, no framework, and zero runtime dependencies.
 
 ## Quick Start
 
 ```bash
-cd openbrowserclaw
 npm install
-npm run dev
+npm start        # Express dev server → http://localhost:3000
 ```
 
-Open `http://localhost:5173`, paste your [Anthropic API key](https://console.anthropic.com/), and start chatting.
+Open Settings, paste your [OpenRouter](https://openrouter.ai/) API key, and start chatting.
 
 ## Architecture
 
+```mermaid
+graph TD
+    User["👤 User"] --> UI["&lt;shadow-claw&gt; Web Component\nChat · Files · Tasks · Settings"]
+
+    UI --> Orchestrator["Orchestrator\n(main thread)"]
+
+    Orchestrator --> MessageQueue["Message Queue\nFIFO per group"]
+    Orchestrator --> StateFSM["State Machine\nidle → thinking → responding"]
+    Orchestrator --> TaskScheduler["Task Scheduler\ncron expressions"]
+    Orchestrator --> Router["Router\nchannel dispatch"]
+
+    MessageQueue --> Worker["Agent Worker\n(Web Worker)"]
+    Worker --> OpenRouter["☁️ OpenRouter API\nClaude / any model"]
+    Worker --> ToolExec["Tool Execution\nbash · js · files · fetch"]
+    ToolExec --> JSShell["JS Shell Emulator\n~40 Unix commands\nvia OPFS"]
+    ToolExec --> WebVM["v86 Alpine Linux VM\n(optional, WASM)"]
+
+    Orchestrator --> IndexedDB["IndexedDB\nmessages · sessions\ntasks · config"]
+    Orchestrator --> OPFS["OPFS / Local Folder\nper-group workspace\nMEMORY.md"]
+
+    UI --> ServiceWorker["Service Worker\nPWA · offline cache"]
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Browser Tab (PWA)                                       │
-│                                                          │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────────────┐  │
-│  │ Chat UI  │  │ Settings │  │ Task Manager           │  │
-│  └────┬─────┘  └─────┬────┘  └───────┬────────────────┘  │
-│       └──────────────┼───────────────┘                   │
-│                      ▼                                   │
-│              Orchestrator (main thread)                  │
-│              ├── Message queue & routing                 │
-│              ├── State machine (idle/thinking/responding)│
-│              └── Task scheduler (cron)                   │
-│                      │                                   │
-│          ┌───────────┼───────────┐                       │
-│          ▼           ▼           ▼                       │
-│     IndexedDB      OPFS    Agent Worker                  │
-│     (messages,   (group    (Claude API                   │
-│      tasks,       files,    tool-use loop,               │
-│      config)     memory)    WebVM sandbox)               │
-│                                                          │
-│  Channels:                                               │
-│  ├── Browser Chat (built-in)                             │
-│  └── Telegram Bot API (optional, pure HTTPS)             │
-└──────────────────────────────────────────────────────────┘
+
+### Message Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant UI as Web Component
+    participant O as Orchestrator
+    participant IDB as IndexedDB
+    participant W as Agent Worker
+    participant OR as OpenRouter
+
+    U->>UI: types message
+    UI->>O: submitMessage()
+    O->>IDB: saveMessage()
+    O->>W: postMessage({type:'invoke'})
+    W->>OR: POST /chat/completions
+    OR-->>W: tool_use response
+    W->>W: executeTool() → OPFS / fetch / JS
+    W->>OR: POST (tool result)
+    OR-->>W: final text response
+    W->>O: postMessage({type:'response'})
+    O->>IDB: saveMessage()
+    O->>UI: signal update → re-render
 ```
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Entry point, bootstraps UI |
-| `src/orchestrator.ts` | State machine, message routing, agent invocation |
-| `src/agent-worker.ts` | Web Worker: Claude API tool-use loop |
-| `src/tools.ts` | Tool definitions (bash, read/write files, fetch, etc.) |
-| `src/vm.ts` | WebVM wrapper (v86 Alpine Linux in WASM) |
-| `src/db.ts` | IndexedDB: messages, sessions, tasks, config |
-| `src/storage.ts` | OPFS: per-group file storage |
-| `src/router.ts` | Routes messages to correct channel |
-| `src/channels/browser-chat.ts` | In-browser chat channel |
-| `src/channels/telegram.ts` | Telegram Bot API channel |
-| `src/task-scheduler.ts` | Cron expression evaluation |
-| `src/crypto.ts` | AES-256-GCM encryption for stored credentials |
-| `src/ui/` | Chat, settings, and task manager components |
+| `index.mjs` | App entry — opens IndexedDB, boots orchestrator, registers SW |
+| `worker.mjs` | Agent Web Worker — owns the LLM tool-use loop |
+| `src/orchestrator.mjs` | State machine, message queue, agent invocation, task scheduling |
+| `src/tools.mjs` | Tool schema definitions sent to the LLM |
+| `src/shell.mjs` | Pure-JS bash-like shell emulator (OPFS filesystem) |
+| `src/vm.mjs` | Optional v86 Alpine Linux VM (falls back to JS shell) |
+| `src/db.mjs` | IndexedDB layer — messages, sessions, tasks, config |
+| `src/storage.mjs` | OPFS + Local Folder file storage, zip export/import |
+| `src/crypto.mjs` | AES-256-GCM encryption for API keys at rest |
+| `src/providers.mjs` | LLM provider registry (OpenRouter + future providers) |
+| `src/router.mjs` | Routes inbound messages to channels |
+| `src/channels/browser-chat.mjs` | Browser chat channel implementation |
+| `src/task-scheduler.mjs` | Cron expression parser and task runner |
+| `src/stores/` | Reactive signal-based UI state (orchestrator, file-viewer, theme) |
+| `src/components/` | Web Components — `<shadow-claw>`, tasks page, files page |
+| `src/config.mjs` | All constants, provider definitions, and config keys |
+| `src/types.mjs` | JSDoc `@typedef` declarations (full type contract) |
+| `src/effect.mjs` | Lightweight `effect()` using TC39 Signal Polyfill |
+| `bin/serve.mjs` | Express dev/prod server with compression and SPA routing |
+| `service-worker/` | Workbox-generated PWA service worker |
 
-## How It Works
-
-1. **You type a message** in the browser chat (or send one via Telegram)
-2. **The orchestrator** checks the trigger pattern, saves to IndexedDB, queues for processing
-3. **The agent worker** (a Web Worker) sends your message + conversation history to the Anthropic API
-4. **Claude responds**, possibly using tools (bash, file I/O, fetch, JavaScript)
-5. **Tool results** are fed back to Claude in a loop until it produces a final text response
-6. **The response** is routed back to the originating channel (browser chat or Telegram)
-
-## Tools
+## Tools Available to the Agent
 
 | Tool | What it does |
 |------|-------------|
-| `bash` | Execute shell commands in a sandboxed Linux VM (Alpine in WASM) |
-| `javascript` | Execute JS code in an isolated scope (lighter than bash) |
-| `read_file` / `write_file` / `list_files` | Manage files in OPFS per-group workspace |
-| `fetch_url` | HTTP requests via browser `fetch()` (subject to CORS) |
-| `update_memory` | Persist context to CLAUDE.md (loaded on every conversation) |
-| `create_task` | Schedule recurring tasks with cron expressions |
+| `bash` | Shell commands — JS emulator or full Alpine VM if assets present |
+| `javascript` | Run JS in an isolated `Function` scope — no DOM, no network |
+| `read_file` / `write_file` / `list_files` | OPFS workspace file I/O |
+| `fetch_url` | HTTP requests via browser `fetch()` — CORS applies |
+| `update_memory` | Write to `MEMORY.md` — loaded as system context every invocation |
+| `create_task` / `list_tasks` / `update_task` / `delete_task` | Scheduled task management |
+| `enable_task` / `disable_task` | Toggle task execution |
 
-## Telegram
+## Storage
 
-Optional. Works entirely via HTTPS — no WebSockets or special protocols.
+```mermaid
+graph LR
+    subgraph IndexedDB ["IndexedDB (shadowclaw)"]
+        messages["messages\n(by group + timestamp)"]
+        sessions["sessions\n(LLM conversation history)"]
+        tasks["tasks\n(scheduled cron jobs)"]
+        config["config\n(API key · provider · model)"]
+    end
 
-1. Create a bot with `@BotFather` on Telegram
-2. Open Settings in OpenBrowserClaw, paste the bot token
-3. Send `/chatid` to your bot to get the chat ID
-4. Add the chat ID in Settings
-5. Messages from Telegram are processed the same as browser chat
+    subgraph FileSystem ["File System"]
+        OPFS["OPFS\nbrowser-sandboxed\nshadowclaw/&lt;groupId&gt;/workspace/"]
+        LocalFolder["Local Folder\nFile System Access API\nuser-chosen directory"]
+    end
 
-**Caveat**: The browser tab must be open for the bot to respond. Messages queue on Telegram's side and are processed when you reopen the tab.
+    OPFS -->|zip export/import| Downloads["⬇️ Downloads"]
+    config -->|AES-256-GCM encrypted| ApiKey["🔑 API Key"]
+```
 
-## WebVM (Optional)
+## WebVM (Optional `bash` Backend)
 
-The `bash` tool runs commands in a v86-emulated Alpine Linux. To enable:
+The `bash` tool has two execution tiers:
 
-1. Download the v86 WASM binary and Alpine rootfs image
-2. Place them in `public/assets/`:
-   - `public/assets/v86.wasm`
-   - `public/assets/v86/libv86.js`
-   - `public/assets/alpine-rootfs.ext2`
-3. The VM boots automatically on first use (~5-15 seconds)
+1. **JS Shell Emulator** (`src/shell.mjs`) — always available, no assets needed.
+   Implements ~40 Unix commands (`cat`, `grep`, `sed`, `awk`, `jq`, `ls`, `mkdir`, etc.)
+   against OPFS. Supports pipes, redirects, `&&`/`||`, variable expansion, command substitution.
 
-Without these assets, the `bash` tool returns a helpful error. All other tools work without the VM.
+2. **v86 Alpine Linux VM** — full x86 Linux in WebAssembly. The worker attempts to boot it
+   on startup; commands fall back to the JS shell while the VM is booting.
+
+   Serve these files at `/assets/` to enable:
+
+   | File | Description |
+   |------|-------------|
+   | `alpine-rootfs.ext2` | Alpine Linux root filesystem |
+   | `bzImage` | Linux kernel |
+   | `initrd` | Initial RAM disk |
+   | `v86.wasm` | v86 WebAssembly binary |
+   | `libv86.mjs` | v86 JavaScript glue |
+   | `seabios.bin` / `vgabios.bin` | Firmware |
+
+## Reactive UI
+
+Vanilla Web Components + **TC39 Signals** (via `signal-polyfill`). A small `effect()`
+helper re-runs DOM updates whenever signals change. No virtual DOM, no framework.
 
 ## Comparison with NanoClaw
 
-| | NanoClaw | OpenBrowserClaw |
-|---|---|---|
+| Feature | NanoClaw | ShadowClaw |
+|---------|----------|------------|
 | Runtime | Node.js process | Browser tab |
-| Agent sandbox | Docker/Apple Container | Web Worker + WebVM |
+| Agent sandbox | Docker / Apple Container | Web Worker + WebVM |
 | Database | SQLite (better-sqlite3) | IndexedDB |
-| Files | Filesystem | OPFS |
+| Files | Filesystem | OPFS + Local Folder |
 | Primary channel | WhatsApp | In-browser chat |
-| Other channels | Telegram, Discord | Telegram |
-| Agent SDK | Claude Agent SDK | Raw Anthropic API |
-| Background tasks | launchd service | setInterval (tab must be open) |
-| Deployment | Self-hosted server | Static files (any CDN) |
-| Dependencies | ~50 npm packages | 0 runtime deps |
+| LLM API | Anthropic SDK | OpenRouter (raw fetch) |
+| Background tasks | launchd service | Service Worker (PWA) |
+| Build step | Required | None (pure ESM) |
+| Runtime dependencies | ~50 npm packages | 0 |
 
 ## Development
 
 ```bash
-npm run dev        # Vite dev server with HMR
-npm run build      # Production build → dist/
-npm run preview    # Preview production build
-npm run typecheck  # TypeScript type checking
+npm start          # Express dev server
+npm test           # Jest (*.test.mjs files live next to source)
+npm run tsc        # TypeScript type-check (JSDoc, --noEmit)
+npm run build      # Type-check + generate service worker
+npm run format     # Prettier
 ```
 
-## Deploy
+## License
 
-```bash
-npm run build
-# Upload dist/ to any static host:
-# GitHub Pages, Cloudflare Pages, Netlify, Vercel, S3, etc.
-```
-
-No server needed. It's just HTML, CSS, and JS.
-
-## Security
-
-OpenBrowserClaw is a proof of concept. All data stays in your browser, nothing is sent to any server except the Anthropic API. Here's an honest look at the current security posture:
-
-**What it does:**
-- API keys are encrypted at rest with AES-256-GCM using a non-extractable `CryptoKey` stored in IndexedDB. JavaScript cannot export the raw key material.
-- All storage (IndexedDB, OPFS) is same-origin scoped by the browser.
-- The agent runs in a Web Worker, separate from the UI thread.
-
-**What it doesn't do (yet):**
-- The encryption protects against casual inspection (DevTools, disk forensics) but not a full XSS attack on the same origin, an attacker with script execution could call the encrypt/decrypt API.
-- The `javascript` tool runs `eval()` in the Worker, which has access to `fetch()`. This means Claude can make arbitrary HTTP requests through the JS tool regardless of any `fetch_url` restrictions.
-- Outgoing HTTP requests (via `fetch_url` or the JS tool) have no user confirmation step.
-- The Telegram bot token is currently stored in plaintext.
-
-This is a single-user local tool, not a multi-tenant platform. Contributions to improve the security model are welcome.
+AGPLv3. Core logic derived from
+[openbrowserclaw](https://github.com/sachaa/openbrowserclaw) (MIT).
