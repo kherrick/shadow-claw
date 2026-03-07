@@ -1015,7 +1015,7 @@ export class ShadowClaw extends HTMLElement {
             </svg>
           </button>
           <h1>
-            <a class="header-title-link" href="https://xt-ml.github.io/shadow-claw/">
+            <a class="header-title-link" href="https://kherrick.github.io/shadow-claw/">
               <svg
                 class="logo"
                 viewBox="0 0 128 128"
@@ -1327,7 +1327,7 @@ export class ShadowClaw extends HTMLElement {
               <a
                 aria-label="Github"
                 class="github-link"
-                href="https://github.com/xt-ml/shadow-claw"
+                href="https://github.com/kherrick/shadow-claw"
               >
                 <svg
                   aria-hidden="true"

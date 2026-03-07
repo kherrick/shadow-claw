@@ -138,7 +138,7 @@ app.use(
           if (
             hostname === "localhost" ||
             hostname === "127.0.0.1" ||
-            hostname === "xt-ml.github.io"
+            hostname === "kherrick.github.io"
           ) {
             if (isVerbose) {
               log(LOG_LEVELS.VERBOSE, `[CORS] Allowed (Localhost match)`);

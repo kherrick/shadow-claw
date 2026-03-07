@@ -113,8 +113,8 @@ export async function initGitFs() {
 /**
  * Derive a short repo name from a URL.
  *
- * "https://github.com/xt-ml/shadow-claw" → "shadow-claw"
- * "https://github.com/xt-ml/shadow-claw.git" → "shadow-claw"
+ * "https://github.com/kherrick/shadow-claw" → "shadow-claw"
+ * "https://github.com/kherrick/shadow-claw.git" → "shadow-claw"
  *
  * @param {string} url
  * @returns {string}

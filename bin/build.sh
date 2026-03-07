@@ -5,7 +5,7 @@ cd "$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )/.." || exit 1
 
 npm run test || exit 1
 
-echo 'https://xt-ml.github.io/shadow-claw/' | node \
+echo 'https://kherrick.github.io/shadow-claw/' | node \
   bin/file-search-replace.mjs \
   'http://localhost:8888' \
   'manifest.json' || exit 1

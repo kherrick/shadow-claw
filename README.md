@@ -1,6 +1,6 @@
-# 🦞 [ShadowClaw](https://xt-ml.github.io/shadow-claw/)
+# 🦞 [ShadowClaw](https://kherrick.github.io/shadow-claw/)
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/xt-ml/shadow-claw)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kherrick/shadow-claw)
 
 Browser-native personal AI assistant. A complete reimagination of NanoClaw — same
 single-user, small-enough-to-understand philosophy, but running entirely in a browser
