@@ -23,7 +23,7 @@ module.exports = {
   ],
   swDest: "./service-worker.js",
   sourcemap: false,
-  importScripts: ["service-worker/fetch-proxy.mjs"],
+  // importScripts: ["service-worker/fetch-proxy.mjs"],
   // https://developer.chrome.com/docs/workbox/modules/workbox-build#property-BasePartial-maximumFileSizeToCacheInBytes
   // maximumFileSizeToCacheInBytes: 1024 * 1024 * 6, // 6MB
   maximumFileSizeToCacheInBytes: 1024 * 1024 * 1024, // 1GB
