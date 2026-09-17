@@ -4,7 +4,7 @@
 
 Browser-native personal AI assistant.
 
-[![ShadowClaw Screenshot](https://xt-ml.github.io/shadow-claw/assets/screenshots/shadow-claw-screenshot-1920x1050.png)](https://xt-ml.github.io/shadow-claw/)
+[![ShadowClaw Screenshot](https://xt-ml.github.io/shadow-claw/assets/screenshots/shadow-claw-screenshot-1920x1052.png)](https://xt-ml.github.io/shadow-claw/)
 
 ## Quick Start
 
